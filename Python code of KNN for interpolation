@@ -1,0 +1,771 @@
+# ============================================================
+# KNN INTERPOLATION OF WATER LEVEL DATA
+# ============================================================
+
+# The boolean-index alignment error is avoided by resetting the
+# DataFrame index and using NumPy arrays for masks.
+# ============================================================
+
+import pandas as pd
+import numpy as np
+import tkinter as tk
+
+from tkinter import filedialog, messagebox
+
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+
+# K values that will be tested
+K_VALUES = [2, 3, 5, 7, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60]
+
+# Percentage of observed values used for validation
+VALIDATION_PERCENTAGE = 20
+
+# Random seed for reproducibility
+RANDOM_STATE = 12345
+
+
+# ============================================================
+# SELECT INPUT FILE
+# ============================================================
+
+def select_input_file():
+
+    root = tk.Tk()
+    root.withdraw()
+
+    input_file = filedialog.askopenfilename(
+        title="Select Excel File",
+        filetypes=[
+            ("Excel files", "*.xlsx *.xls"),
+            ("All files", "*.*")
+        ]
+    )
+
+    root.destroy()
+
+    return input_file
+
+
+# ============================================================
+# SELECT OUTPUT FILE
+# ============================================================
+
+def select_output_file():
+
+    root = tk.Tk()
+    root.withdraw()
+
+    output_file = filedialog.asksaveasfilename(
+        title="Save Interpolated Excel File",
+        defaultextension=".xlsx",
+        filetypes=[
+            ("Excel files", "*.xlsx")
+        ]
+    )
+
+    root.destroy()
+
+    return output_file
+
+
+# ============================================================
+# READ AND PREPARE DATA
+# ============================================================
+
+def read_and_prepare_data(input_file):
+
+    print("\nReading Excel file...")
+    print("File:", input_file)
+
+    df = pd.read_excel(input_file)
+
+    print("\nOriginal columns:")
+    print(df.columns.tolist())
+
+    if len(df.columns) < 2:
+        raise ValueError(
+            "The Excel file must contain at least two columns:\n"
+            "Column 1 = DateTime\n"
+            "Column 2 = Water Level"
+        )
+
+    # --------------------------------------------------------
+    # Rename first two columns
+    # --------------------------------------------------------
+
+    date_column = df.columns[0]
+    water_level_column = df.columns[1]
+
+    df = df.rename(
+        columns={
+            date_column: "DateTime",
+            water_level_column: "Water_Level"
+        }
+    )
+
+    # --------------------------------------------------------
+    # Convert DateTime
+    # --------------------------------------------------------
+
+    df["DateTime"] = pd.to_datetime(
+        df["DateTime"],
+        errors="coerce"
+    )
+
+    # --------------------------------------------------------
+    # Convert Water Level to numeric
+    # --------------------------------------------------------
+
+    df["Water_Level"] = pd.to_numeric(
+        df["Water_Level"],
+        errors="coerce"
+    )
+
+    # --------------------------------------------------------
+    # Remove rows with invalid DateTime
+    # --------------------------------------------------------
+
+    invalid_dates = df["DateTime"].isna().sum()
+
+    if invalid_dates > 0:
+        print(
+            f"\nWARNING: {invalid_dates} rows have invalid DateTime "
+            "and will be removed."
+        )
+
+        df = df.dropna(subset=["DateTime"])
+
+    # --------------------------------------------------------
+    # Sort chronologically
+    # --------------------------------------------------------
+
+    df = df.sort_values(
+        by="DateTime"
+    )
+
+    # --------------------------------------------------------
+    # VERY IMPORTANT
+    # Reset index to avoid boolean alignment problems
+    # --------------------------------------------------------
+
+    df = df.reset_index(drop=True)
+
+    print("\nData preparation completed.")
+
+    print("Number of rows:", len(df))
+
+    print(
+        "Observed water levels:",
+        df["Water_Level"].notna().sum()
+    )
+
+    print(
+        "Missing water levels:",
+        df["Water_Level"].isna().sum()
+    )
+
+    return df
+
+
+# ============================================================
+# CREATE TIME FEATURE
+# ============================================================
+
+def create_time_feature(df):
+
+    # Convert DateTime into numerical time.
+    #
+    # Instead of using the pandas index, actual elapsed time
+    # from the first observation is used.
+
+    time_difference = (
+        df["DateTime"] - df["DateTime"].iloc[0]
+    )
+
+    time_days = (
+        time_difference.dt.total_seconds() / 86400.0
+    )
+
+    return time_days.to_numpy().reshape(-1, 1)
+
+
+# ============================================================
+# VALIDATE DIFFERENT K VALUES
+# ============================================================
+
+def validate_k_values(df, k_values):
+
+    print("\n")
+    print("=" * 70)
+    print("K-VALUE VALIDATION")
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # Reset index again for absolute safety
+    # --------------------------------------------------------
+
+    df = df.reset_index(drop=True)
+
+    # --------------------------------------------------------
+    # Create numerical time feature
+    # --------------------------------------------------------
+
+    X_all = create_time_feature(df)
+
+    # --------------------------------------------------------
+    # Get observed water-level values
+    # --------------------------------------------------------
+
+    observed_mask = df["Water_Level"].notna().to_numpy()
+
+    observed_indices = np.where(observed_mask)[0]
+
+    if len(observed_indices) < 10:
+        raise ValueError(
+            "There are not enough observed water-level values "
+            "for KNN validation."
+        )
+
+    X_observed = X_all[observed_indices]
+
+    y_observed = (
+        df.loc[
+            observed_indices,
+            "Water_Level"
+        ]
+        .to_numpy()
+    )
+
+    # --------------------------------------------------------
+    # Randomly divide observed data into training and
+    # validation datasets
+    # --------------------------------------------------------
+
+    rng = np.random.default_rng(RANDOM_STATE)
+
+    shuffled_indices = rng.permutation(
+        len(observed_indices)
+    )
+
+    validation_size = int(
+        len(observed_indices)
+        * VALIDATION_PERCENTAGE
+        / 100
+    )
+
+    # Ensure at least one validation observation
+    validation_size = max(
+        1,
+        validation_size
+    )
+
+    validation_positions = shuffled_indices[
+        :validation_size
+    ]
+
+    train_positions = shuffled_indices[
+        validation_size:
+    ]
+
+    X_train = X_observed[train_positions]
+    y_train = y_observed[train_positions]
+
+    X_validation = X_observed[
+        validation_positions
+    ]
+
+    y_validation = y_observed[
+        validation_positions
+    ]
+
+    print("\nObserved data:", len(observed_indices))
+    print("Training data:", len(train_positions))
+    print("Validation data:", len(validation_positions))
+
+    # --------------------------------------------------------
+    # Validate each K
+    # --------------------------------------------------------
+
+    validation_results = []
+
+    for k in k_values:
+
+        print(
+            f"\nTesting K = {k} ..."
+        )
+
+        # K cannot exceed the number of training observations
+        if k > len(X_train):
+
+            print(
+                f"K = {k} skipped because it is larger "
+                f"than training data size ({len(X_train)})."
+            )
+
+            continue
+
+        model = KNeighborsRegressor(
+            n_neighbors=k,
+            weights="distance"
+        )
+
+        model.fit(
+            X_train,
+            y_train
+        )
+
+        y_pred = model.predict(
+            X_validation
+        )
+
+        rmse = np.sqrt(
+            mean_squared_error(
+                y_validation,
+                y_pred
+            )
+        )
+
+        mae = mean_absolute_error(
+            y_validation,
+            y_pred
+        )
+
+        r2 = r2_score(
+            y_validation,
+            y_pred
+        )
+
+        validation_results.append(
+            {
+                "K": k,
+                "RMSE": rmse,
+                "MAE": mae,
+                "R2": r2
+            }
+        )
+
+        print(
+            f"K = {k:2d} | "
+            f"RMSE = {rmse:.6f} | "
+            f"MAE = {mae:.6f} | "
+            f"R² = {r2:.6f}"
+        )
+
+    # --------------------------------------------------------
+    # Convert results to DataFrame
+    # --------------------------------------------------------
+
+    validation_results = pd.DataFrame(
+        validation_results
+    )
+
+    if validation_results.empty:
+        raise ValueError(
+            "No K values could be tested."
+        )
+
+    # --------------------------------------------------------
+    # Select K with minimum RMSE
+    # --------------------------------------------------------
+
+    best_row = validation_results.loc[
+        validation_results["RMSE"].idxmin()
+    ]
+
+    best_k = int(
+        best_row["K"]
+    )
+
+    print("\n")
+    print("=" * 70)
+    print("BEST K")
+    print("=" * 70)
+
+    print(
+        f"Best K = {best_k}"
+    )
+
+    print(
+        f"Best RMSE = {best_row['RMSE']:.6f}"
+    )
+
+    print(
+        f"Best MAE = {best_row['MAE']:.6f}"
+    )
+
+    print(
+        f"Best R² = {best_row['R2']:.6f}"
+    )
+
+    return validation_results, best_k
+
+
+# ============================================================
+# KNN INTERPOLATION
+# ============================================================
+
+def perform_knn_interpolation(df, best_k):
+
+    print("\n")
+    print("=" * 70)
+    print("PERFORMING KNN INTERPOLATION")
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # Reset index
+    # --------------------------------------------------------
+
+    df = df.reset_index(drop=True)
+
+    # --------------------------------------------------------
+    # Time feature
+    # --------------------------------------------------------
+
+    X_all = create_time_feature(df)
+
+    # --------------------------------------------------------
+    # Observed and missing masks
+    # --------------------------------------------------------
+
+    observed_mask = (
+        df["Water_Level"]
+        .notna()
+        .to_numpy()
+    )
+
+    missing_mask = (
+        df["Water_Level"]
+        .isna()
+        .to_numpy()
+    )
+
+    observed_indices = np.where(
+        observed_mask
+    )[0]
+
+    missing_indices = np.where(
+        missing_mask
+    )[0]
+
+    if len(missing_indices) == 0:
+
+        print(
+            "\nNo missing water-level values were found."
+        )
+
+        return df
+
+    if len(observed_indices) == 0:
+
+        raise ValueError(
+            "No observed water-level values are available."
+        )
+
+    # --------------------------------------------------------
+    # Training data
+    # --------------------------------------------------------
+
+    X_train = X_all[
+        observed_indices
+    ]
+
+    y_train = (
+        df.loc[
+            observed_indices,
+            "Water_Level"
+        ]
+        .to_numpy()
+    )
+
+    # --------------------------------------------------------
+    # Missing data locations
+    # --------------------------------------------------------
+
+    X_missing = X_all[
+        missing_indices
+    ]
+
+    # --------------------------------------------------------
+    # Make sure K is not larger than available observations
+    # --------------------------------------------------------
+
+    actual_k = min(
+        best_k,
+        len(X_train)
+    )
+
+    # --------------------------------------------------------
+    # Train final KNN model
+    # --------------------------------------------------------
+
+    model = KNeighborsRegressor(
+        n_neighbors=actual_k,
+        weights="distance"
+    )
+
+    model.fit(
+        X_train,
+        y_train
+    )
+
+    # --------------------------------------------------------
+    # Predict missing values
+    # --------------------------------------------------------
+
+    predicted_values = model.predict(
+        X_missing
+    )
+
+    # --------------------------------------------------------
+    # Create output column
+    # --------------------------------------------------------
+
+    df["Water_Level_KNN"] = (
+        df["Water_Level"]
+    )
+
+    # --------------------------------------------------------
+    # Fill ONLY missing values
+    # --------------------------------------------------------
+
+    df.loc[
+        missing_indices,
+        "Water_Level_KNN"
+    ] = predicted_values
+
+    # --------------------------------------------------------
+    # Mark interpolated values
+    # --------------------------------------------------------
+
+    df["Interpolation_Status"] = "Observed"
+
+    df.loc[
+        missing_indices,
+        "Interpolation_Status"
+    ] = "KNN Interpolated"
+
+    # --------------------------------------------------------
+    # Show information
+    # --------------------------------------------------------
+
+    print(
+        f"\nNumber of missing values: "
+        f"{len(missing_indices)}"
+    )
+
+    print(
+        f"Number of interpolated values: "
+        f"{len(predicted_values)}"
+    )
+
+    print(
+        f"Final K used: {actual_k}"
+    )
+
+    return df
+
+
+# ============================================================
+# SAVE RESULTS
+# ============================================================
+
+def save_results(
+    output_file,
+    final_df,
+    validation_results
+):
+
+    print("\nSaving results...")
+
+    # --------------------------------------------------------
+    # Excel writer
+    # --------------------------------------------------------
+
+    with pd.ExcelWriter(
+        output_file,
+        engine="openpyxl"
+    ) as writer:
+
+        # Main interpolated dataset
+        final_df.to_excel(
+            writer,
+            sheet_name="KNN_Interpolated",
+            index=False
+        )
+
+        # K validation results
+        validation_results.to_excel(
+            writer,
+            sheet_name="K_Validation",
+            index=False
+        )
+
+    print(
+        "\nResults successfully saved to:"
+    )
+
+    print(output_file)
+
+
+# ============================================================
+# MAIN PROGRAM
+# ============================================================
+
+def main():
+
+    print("\n")
+    print("=" * 70)
+    print("KNN WATER LEVEL INTERPOLATION")
+    print("=" * 70)
+
+    try:
+
+        # ----------------------------------------------------
+        # STEP 1: Select input Excel file
+        # ----------------------------------------------------
+
+        input_file = select_input_file()
+
+        if not input_file:
+
+            print(
+                "\nNo input file selected."
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # STEP 2: Read and prepare data
+        # ----------------------------------------------------
+
+        df = read_and_prepare_data(
+            input_file
+        )
+
+        # ----------------------------------------------------
+        # Check missing values
+        # ----------------------------------------------------
+
+        missing_count = (
+            df["Water_Level"]
+            .isna()
+            .sum()
+        )
+
+        if missing_count == 0:
+
+            print(
+                "\nNo missing water-level values found."
+            )
+
+            print(
+                "There is nothing to interpolate."
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # STEP 3: Validate K values
+        # ----------------------------------------------------
+
+        validation_results, best_k = (
+            validate_k_values(
+                df,
+                K_VALUES
+            )
+        )
+
+        # ----------------------------------------------------
+        # STEP 4: Perform final KNN interpolation
+        # ----------------------------------------------------
+
+        final_df = perform_knn_interpolation(
+            df,
+            best_k
+        )
+
+        # ----------------------------------------------------
+        # STEP 5: Select output file
+        # ----------------------------------------------------
+
+        output_file = select_output_file()
+
+        if not output_file:
+
+            print(
+                "\nNo output file selected."
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # STEP 6: Save results
+        # ----------------------------------------------------
+
+        save_results(
+            output_file,
+            final_df,
+            validation_results
+        )
+
+        # ----------------------------------------------------
+        # Completion message
+        # ----------------------------------------------------
+
+        root = tk.Tk()
+        root.withdraw()
+
+        messagebox.showinfo(
+            "Completed",
+            "KNN water-level interpolation completed successfully.\n\n"
+            f"Best K = {best_k}\n"
+            f"Missing values interpolated = {missing_count}\n\n"
+            f"Output file:\n{output_file}"
+        )
+
+        root.destroy()
+
+    except Exception as e:
+
+        print("\n")
+        print("=" * 70)
+        print("ERROR")
+        print("=" * 70)
+
+        print(
+            type(e).__name__,
+            ":",
+            str(e)
+        )
+
+        try:
+
+            root = tk.Tk()
+            root.withdraw()
+
+            messagebox.showerror(
+                "Error",
+                f"{type(e).__name__}:\n\n{str(e)}"
+            )
+
+            root.destroy()
+
+        except Exception:
+
+            pass
+
+
+# ============================================================
+# RUN PROGRAM
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
+
